@@ -1,6 +1,5 @@
 # ═══════════════════════════════════════════════════════════════════════════
-#  main.py — SEMY EDITION (AUTO-REPEAT ∞)
-#  1 Match → End → all connections closed → 3s off → repeat ∞ (cache reuses login)
+#  main.py — SEMY EDITION (AUTO: IND + match start, no prompt)
 #  Owner: SEMY | Telegram: @SEMY
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -11,8 +10,8 @@ import time
 
 _OWNER_NAME = "SEMY"
 _TG_ID = "@SEMY"
-
-COOLDOWN_AFTER_MATCH = 3.0   # cleanup grace before next round
+DEFAULT_REGION = "IND"      # ← auto-selected region
+COOLDOWN_AFTER_MATCH = 3.0  # cleanup grace
 
 
 def _show_banner():
@@ -26,7 +25,7 @@ def _show_banner():
 ║  ██║  ██║██║ ╚████║╚██████╔╝██║  ██║██║  ██║╚██████╔╝        ║
 ║  ╚═╝  ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝         ║
 ║                                                              ║
-║  SINGH EDITION — All Regions Support (AUTO-REPEAT ∞)         ║
+║  SINGH EDITION — AUTO MODE (IND + AUTO MATCH ∞)              ║
 ║                                                              ║
 ║  Owner      : {_OWNER_NAME:<46}║
 ║  Telegram   : {_TG_ID:<46}║
@@ -36,7 +35,6 @@ def _show_banner():
 
 
 def _close_leaked_aiohttp():
-    """Safety net: close aiohttp session if match.py somehow leaked it."""
     try:
         from match import _aiohttp_session as _m_sess
         if _m_sess is not None and not _m_sess.closed:
@@ -49,21 +47,83 @@ def _close_leaked_aiohttp():
         pass
 
 
-def run_match_loop():
-    """Infinite loop: round N → close all → 3s cooldown → round N+1."""
+async def _run_match_with_region(region: str):
+    """Patch match.start_match_interactive to skip region prompt."""
+    import match
+
+    # Override input() inside start_match_interactive so it auto-picks region
+    original_input = None
+    try:
+        original_input = match.__dict__.get('_orig_builtin_input')
+    except Exception:
+        pass
+
+    # Simpler: monkeypatch builtins.input temporarily so region prompt
+    # returns the numeric index of DEFAULT_REGION, and no further prompts block.
+    import builtins
+    orig_input = builtins.input
+
+    region_idx = "1"
+    try:
+        from core import REGION_LIST as _REGIONS
+        if region in _REGIONS:
+            region_idx = str(_REGIONS.index(region) + 1)
+    except Exception:
+        pass
+
+    _prompt_count = {"n": 0}
+    def _auto_input(prompt=""):
+        _prompt_count["n"] += 1
+        # First call inside start_match_interactive = region choice
+        if _prompt_count["n"] == 1:
+            return region_idx
+        # Any further input() calls → return empty string (no blocking)
+        return ""
+
+    builtins.input = _auto_input
+    try:
+        await match.start_match_interactive()
+    finally:
+        builtins.input = orig_input
+
+
+def run_auto_loop():
+    """Auto: pick IND + start match ∞ — no prompts, no menu."""
     from match import start_match_interactive
 
-    match_round = 0
+    round_n = 0
     while True:
-        match_round += 1
+        round_n += 1
         print()
         print("  ╔══════════════════════════════════════════╗")
-        print(f"  ║       MATCH ROUND #{match_round:<3}                 ║")
+        print(f"  ║       AUTO MATCH ROUND #{round_n:<3}              ║")
+        print(f"  ║       Region: {DEFAULT_REGION:<27}║")
         print("  ╚══════════════════════════════════════════╝")
         print()
 
         try:
-            asyncio.run(start_match_interactive())
+            # Patch input for region auto-select
+            import builtins
+            orig_input = builtins.input
+            try:
+                from core import REGION_LIST as _REGIONS
+                region_idx = str(_REGIONS.index(DEFAULT_REGION) + 1) \
+                    if DEFAULT_REGION in _REGIONS else "1"
+            except Exception:
+                region_idx = "1"
+
+            _prompt_count = {"n": 0}
+            def _auto_input(prompt=""):
+                _prompt_count["n"] += 1
+                if _prompt_count["n"] == 1:
+                    return region_idx
+                return ""
+
+            builtins.input = _auto_input
+            try:
+                asyncio.run(start_match_interactive())
+            finally:
+                builtins.input = orig_input
 
             print()
             print("  ✅ Round complete — all connections closed.")
@@ -72,12 +132,11 @@ def run_match_loop():
 
         except KeyboardInterrupt:
             print()
-            print("  🛑 Ctrl+C — stopping auto-repeat loop.")
-            raise   # propagate up to menu
-
+            print("  🛑 Ctrl+C — stopping auto loop.")
+            raise
         except Exception as e:
             print()
-            print(f"  X Round #{match_round} error: {e}")
+            print(f"  X Round #{round_n} error: {e}")
             import traceback
             traceback.print_exc()
             print(f"  ⏳ Retrying in {COOLDOWN_AFTER_MATCH:.0f}s...")
@@ -86,57 +145,26 @@ def run_match_loop():
             _close_leaked_aiohttp()
 
 
-def main_menu():
+def main():
     _show_banner()
-    while True:
-        print()
-        print("  ╔══════════════════════════════════════════╗")
-        print("  ║         MAIN MENU  BY SEMY               ║")
-        print("  ╠══════════════════════════════════════════╣")
-        print("  ║  1. Start Match (auto-repeat ∞)          ║")
-        print("  ║  2. Exit                                 ║")
-        print("  ╚══════════════════════════════════════════╝")
-        print()
+    print()
+    print(f"  🚀 AUTO MODE: Region={DEFAULT_REGION}, auto match ∞")
+    print("  🛑 Press Ctrl+C anytime to stop")
+    print()
+    time.sleep(1.0)
 
-        try:
-            choice = input("  > ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            print("  👋 Bye.")
-            break
-
-        if choice == "1":
-            try:
-                run_match_loop()
-            except KeyboardInterrupt:
-                print()
-                print("  ↩  Auto-repeat stopped — returning to menu...")
-                time.sleep(1.0)
-                continue
-        elif choice == "2":
-            print()
-            print("  👋 Bye.")
-            break
-        else:
-            print("  ! Invalid choice")
-
-        print()
-        try:
-            input("  Press Enter to return to menu...")
-        except (EOFError, KeyboardInterrupt):
-            print()
-            print("  👋 Bye.")
-            break
-
-
-if __name__ == "__main__":
     try:
-        main_menu()
+        run_auto_loop()
     except KeyboardInterrupt:
-        print("\n  👋 interrupted — exiting.")
+        print()
+        print("  👋 Stopped by user.")
         sys.exit(0)
     except Exception as e:
         print(f"\n  Fatal error: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
