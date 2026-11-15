@@ -1,5 +1,6 @@
 #═══════════════════════════════════════════════════════════════════════════
 #  match.py — Final (offline + fresh TCP + cache login + auto-repeat ∞)
+#  3 match-end detection fixes applied
 #  Owner: AVI CODEX | Telegram: @AVI_CODEXX
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -66,13 +67,15 @@ from core import (
 )
 
 # ═══════════════ CONSTANTS ═══════════════
-MAX_MATCH_DURATION      = 3000
-MATCH_IDLE_TIMEOUT      = 150.0
+# ═══ CHANGE 1: 3000 → 700 (11.6 min hard cap) ═══
+MAX_MATCH_DURATION      = 700
+# ═══ CHANGE 2: 150.0 → 30.0 (30s idle timeout) ═══
+MATCH_IDLE_TIMEOUT      = 30.0
 HANDSHAKE_TIMEOUT       = 45.0
 EXP_REFRESH_AFTER_MATCH_DELAY = 9.0
 NON_MATCH_RECONNECT_DELAY      = 1.0
-SESSION_RETRY_DELAY            = 3.0    # ← 3s: next round wait (was 5.0)
-AFTER_MATCH_COOLDOWN           = 3.0    # ← 3s: close → offline before retry
+SESSION_RETRY_DELAY            = 3.0
+AFTER_MATCH_COOLDOWN           = 3.0
 
 BR_MODE_ID = 1
 BR_MAP_ID  = 1
@@ -120,21 +123,21 @@ PING_REAL_IP     = "103.109.214.211"
 
 TEAM_MODE               = True
 TEAM_SIZE               = 4
-TEAM_PEER_WAIT_TIMEOUT  = 25.0
-TEAM_CREATE_WAIT        = 4.0
-TEAM_INVITE_CYCLE_WAIT  = 4.0
-TEAM_INVITE_MAX_TIME    = 120.0
-TEAM_HEARTBEAT_INTERVAL = 3.0
+TEAM_PEER_WAIT_TIMEOUT  = 15.0
+TEAM_CREATE_WAIT        = 3.0
+TEAM_INVITE_CYCLE_WAIT  = 2.5
+TEAM_INVITE_MAX_TIME    = 12.0
+TEAM_HEARTBEAT_INTERVAL = 4.0
 TEAM_IDLE_ITERS_TEAM    = 1800
-TEAM_MEMBER_START_DELAY = 20.0
-TEAM_FINAL_WAIT         = 8.0
-TEAM_READY_DELAY        = 5.0
+TEAM_MEMBER_START_DELAY = 4.0
+TEAM_FINAL_WAIT         = 12.0
+TEAM_READY_DELAY        = 3.0
 
 FORCED_CLIENT_VERSION = "2.133.13"
 
 # ═══════════════ LOGIN CACHE ═══════════════
 LOGIN_CACHE_FILE = "squad_accounts_cache.json"
-CACHE_TTL = 6 * 3600
+CACHE_TTL = 24 * 3600
 
 _login_cache: Dict[str, dict] = {}
 _login_cache_lock = asyncio.Lock()
@@ -168,10 +171,19 @@ def _save_login_cache_file():
 
 def _cache_get(uid: str) -> Optional[dict]:
     rec = _login_cache.get(str(uid))
-    if not rec: return None
-    if time.time() - rec.get("cached_at", 0) > CACHE_TTL: return None
+    if not rec:
+        return None
+    if time.time() - rec.get("cached_at", 0) > CACHE_TTL:
+        return None
     for k in ("account_id", "token", "aes_ak", "iv_i", "game_server", "region"):
-        if k not in rec or not rec[k]: return None
+        if k not in rec or not rec[k]:
+            return None
+    rec["cached_at"] = time.time()
+    _login_cache[str(uid)] = rec
+    try:
+        _save_login_cache_file()
+    except Exception:
+        pass
     return rec
 
 
@@ -1375,6 +1387,8 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
     ping_stop = asyncio.Event(); anti_stop = asyncio.Event(); move_stop = asyncio.Event()
     uid_str = str(account_id); completed = False; died = False
     move_state = MoveState()
+    # ═══ CHANGE 3: track last cmd=2001 (own-state sync) ═══
+    last_2001_time = time.time()
 
     try:
         ip, port = server_ip_port.split(":"); port = int(port)
@@ -1445,13 +1459,20 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
             try:
                 resp, saddr = await asyncio.wait_for(loop.sock_recvfrom(sock, 65535), timeout=1.5)
                 if resp:
-                    last_activity = time.time()
                     frame = await decode_packet(resp, udp_key_bytes, match_code)
                     if frame:
                         try: move_state.on_server_frame(frame)
                         except Exception: pass
 
                         pt = await classify(frame)
+
+                        # ═══ CHANGE 3a: only real packets count as activity ═══
+                        if pt not in ("PING", "ACK"):
+                            last_activity = time.time()
+
+                        # ═══ CHANGE 3b: track cmd=2001 ═══
+                        if frame['cmd'] == 2001:
+                            last_2001_time = time.time()
 
                         if frame['cmd'] in [103, 107]:
                             if not died:
@@ -1499,8 +1520,14 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                         except Exception: pass
                         last_activity = time.time()
                 elif ack_state == "thunder_sharma_sent":
+                    # ═══ CHANGE 3c: match end detection ═══
+                    # 1) 30s idle (no real packets — keepalive ignored)
                     if (time.time() - last_activity) > MATCH_IDLE_TIMEOUT:
-                        print_success(f"[MATCH #{match_index}] Finished naturally")
+                        print_success(f"[MATCH #{match_index}] Idle timeout ({MATCH_IDLE_TIMEOUT:.0f}s) → match ended")
+                        completed = True; break
+                    # 2) 45s no cmd=2001 → player out of map / match ended
+                    if (time.time() - last_2001_time) > 45.0:
+                        print_success(f"[MATCH #{match_index}] No own-state 45s → match ended")
                         completed = True; break
                 continue
             except BlockingIOError: await asyncio.sleep(0.05)
@@ -1534,7 +1561,6 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
             except Exception: pass
         rem = await _dec_match(uid_str)
         print_info(f"[MATCH #{match_index}] Closed. UID:{rem}")
-        # AUTO-REPEAT: NO stop flag → account_loop_guest will re-login fresh
 
 # ═══════════════ FUNCTIONAL BATTLE ROYALE ═══════════════
 async def functional_battle_royale(addrs, starter_packet, account_region, client_version,
@@ -1568,11 +1594,17 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
     async def _team_coordinator():
         try:
             deadline = time.time() + TEAM_PEER_WAIT_TIMEOUT
+            min_ok = max(2, grp.size - 1)
             while time.time() < deadline:
                 async with grp.lock:
                     n = len(grp.peers)
                 if n >= grp.size: break
-                await asyncio.sleep(0.4)
+                if n >= min_ok:
+                    await asyncio.sleep(1.5)
+                    async with grp.lock:
+                        n2 = len(grp.peers)
+                    if n2 >= min_ok: break
+                await asyncio.sleep(0.3)
 
             async with grp.lock:
                 is_leader = (grp.leader_uid == uid_str)
@@ -1911,11 +1943,9 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                                     print_error(f"[MATCH #{match_index}] crashed: {e}")
                                 current_match_task = None
 
-                                # ═══ CLOSE ALL → OFFLINE → account_loop_guest does FRESH LOGIN ═══
                                 print_success(f"[MATCH #{match_index}] ended. Closing TCP → offline → next round re-login.")
                                 await asyncio.sleep(AFTER_MATCH_COOLDOWN)
 
-                                # Return → finally block closes writer → account_loop_guest retries with fresh login
                                 return
                             else:
                                 print_warning(f"[FUNC-{grp.tag()}] missing fields")
@@ -2014,7 +2044,6 @@ async def account_loop_guest(uid, password, grp: TeamGroup,
                         print_error(f"[RETRY] {uid}: {e}")
                         traceback.print_exc()
 
-                    # ═══ Match ended → TCP closed → fresh login ═══
                     print_warning(f"[RETRY] {uid} session ended, restart {SESSION_RETRY_DELAY}s")
                     await asyncio.sleep(SESSION_RETRY_DELAY)
                     try:
